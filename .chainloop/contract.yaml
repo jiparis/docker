@@ -20,5 +20,8 @@ spec:
       - ref: vulnerabilities
         with:
           severity: HIGH
+      # Custom policy stored in the demo org. It detects Java4Shell from the SBOM
+      # before scanner databases match it, and creates a vulnerability finding.
+      - ref: java4shell-cve-2026-114938
   runner:
     type: GITHUB_ACTION

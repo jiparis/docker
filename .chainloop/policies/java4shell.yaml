@@ -1,0 +1,137 @@
+apiVersion: workflowcontract.chainloop.dev/v1
+kind: Policy
+metadata:
+  name: java4shell-cve-2026-114938
+  description: |
+    Zero-day detection of Java4Shell (CVE-2026-114938) in CycloneDX SBOMs, before scanner databases can match it.
+    It flags Java runtimes installed outside of distro packages (for example Eclipse Temurin, detected by syft's
+    java-jvm-cataloger as pkg:generic/oracle/openjdk) whose version is in an affected range, and reports them as
+    vulnerability findings. Distro packages (deb, rpm, apk) are skipped because distro feeds already cover them.
+  annotations:
+    category: security,CVE
+  # Violations are structured PolicyVulnerabilityFinding objects, so they become findings in Chainloop.
+  # They use the same (CVE id, package PURL) key that a scanner match would use, so they deduplicate with it.
+  finding_type: VULNERABILITY
+spec:
+  inputs:
+    - name: affected
+      description: >-
+        Comma-separated inclusive version ranges "min:max". The defaults use the lowest version named in the
+        Calif disclosure for 17 and the latest versions Oracle lists as affected in the November 2026 CPU.
+      required: false
+      default: "17.0.6:17.0.21,21.0.0:21.0.13,25.0.0:25.0.5,27.0.0:27.0.1"
+  policies:
+    - kind: SBOM_CYCLONEDX_JSON
+      embedded: |
+        package java4shell
+
+        import rego.v1
+
+        result := {
+          "skipped": skipped,
+          "violations": violations,
+          "findings": findings,
+          "skip_reason": skip_reason,
+          "ignore": false,
+        }
+
+        default skipped := true
+
+        skipped := false if valid_input
+
+        default skip_reason := ""
+
+        skip_reason := "the SBOM has no components" if not valid_input
+
+        valid_input if count(object.get(input, "components", [])) > 0
+
+        cve := "CVE-2026-114938"
+
+        default affected_arg := "17.0.6:17.0.21,21.0.0:21.0.13,25.0.0:25.0.5,27.0.0:27.0.1"
+
+        affected_arg := input.args.affected if input.args.affected
+
+        # Chainloop passes a comma-separated input as an array; a single range comes as a string
+        range_strings contains r if {
+          is_string(affected_arg)
+          some r in split(affected_arg, ",")
+        }
+
+        range_strings contains r if {
+          is_array(affected_arg)
+          some r in affected_arg
+        }
+
+        ranges contains {"min": parse(bounds[0]), "max": parse(bounds[1])} if {
+          some r in range_strings
+          bounds := split(trim_space(r), ":")
+          count(bounds) == 2
+        }
+
+        # "21.0.13", "21.0.13+11", "25" -> [major, minor, patch] as numbers
+        parse(v) := [part(parts, 0), part(parts, 1), part(parts, 2)] if {
+          core := split(split(split(v, "+")[0], "-")[0], "_")[0]
+          parts := split(core, ".")
+        }
+
+        part(parts, i) := to_number(parts[i]) if count(parts) > i
+
+        part(parts, i) := 0 if count(parts) <= i
+
+        version_lte(a, b) if a[0] < b[0]
+        version_lte(a, b) if { a[0] == b[0]; a[1] < b[1] }
+        version_lte(a, b) if { a[0] == b[0]; a[1] == b[1]; a[2] <= b[2] }
+
+        in_range(v) if {
+          some r in ranges
+          version_lte(r.min, v)
+          version_lte(v, r.max)
+        }
+
+        jvm_names := {"openjdk", "jdk", "jre", "temurin"}
+
+        # A Java runtime installed from an archive, not from a distro package
+        is_jvm(comp) if {
+          startswith(object.get(comp, "purl", ""), "pkg:generic/")
+          lower(comp.name) in jvm_names
+        }
+
+        is_jvm(comp) if {
+          not distro_package(comp)
+          parts := split(object.get(comp, "cpe", ""), ":")
+          count(parts) > 5
+          parts[4] in jvm_names
+        }
+
+        distro_package(comp) if {
+          some prefix in ["pkg:deb/", "pkg:rpm/", "pkg:apk/"]
+          startswith(object.get(comp, "purl", ""), prefix)
+        }
+
+        location(comp) := p if {
+          some prop in object.get(comp, "properties", [])
+          prop.name == "syft:location:0:path"
+          p := prop.value
+        } else := object.get(comp, "bom-ref", "")
+
+        findings contains f if {
+          valid_input
+          some comp in input.components
+          is_jvm(comp)
+          comp.version
+          in_range(parse(comp.version))
+          f := {
+            "message": sprintf("Found vulnerability %s (HIGH) affecting component %s, version %s (Java4Shell)", [cve, comp.name, comp.version]),
+            "description": "Java4Shell: memory corruption in the OpenJDK hardware-accelerated Base64 decoder (AVX-512 VBMI intrinsic) that can lead to remote code execution when an application decodes attacker-controlled Base64 data.",
+            "external_id": cve,
+            "package_purl": comp.purl,
+            "severity": "HIGH",
+            "cvss_v3_score": 8.1,
+            "cwes": [],
+            "recommendation": "Upgrade the Java runtime to a build that includes the Oracle November 2026 CPU fix. Until then, start the JVM with -XX:-UseBASE64Intrinsics (or -XX:UseAVX=2 on x86-64).",
+            "fixed_version": "",
+            "location": location(comp),
+          }
+        }
+
+        violations contains f.message if some f in findings
